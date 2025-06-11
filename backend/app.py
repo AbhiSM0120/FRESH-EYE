@@ -10,14 +10,30 @@ from nutrition_extraction import extract_nutrition
 from dotenv import load_dotenv
 import requests
 from flask_cors import CORS
+from serial_reader import SerialReader, ARDUINO_CONFIG
+import base64
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 
 # Load environment variables from .env
 load_dotenv()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY if GEMINI_API_KEY else None
+SMTP_SERVER = os.getenv('SMTP_SERVER')
+SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
+SMTP_USERNAME = os.getenv('SMTP_USERNAME')
+SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
+SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 
 app = Flask(__name__)
-CORS(app, resources={r"/*":{"origins":["http://localhost:5173"]}})
+CORS(app)  # Enable CORS for all routes
+
+# Initialize serial reader as a global singleton
+serial_reader = SerialReader()
 
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -88,7 +104,6 @@ def predict_with_gemini(image_bytes):
     if not GEMINI_API_KEY or not GEMINI_API_URL:
         return None
     try:
-        import base64
         img_b64 = base64.b64encode(image_bytes).decode('utf-8')
         payload = {
             "contents": [
@@ -201,14 +216,210 @@ def get_latest_prediction_result():
         print(f"Error processing latest image for prediction: {e}")
         return jsonify({"status": "error", "message": f"Failed to get latest prediction: {str(e)}"}), 500
 
+def analyze_nutrition_with_gemini(text):
+    if not GEMINI_API_KEY or not GEMINI_API_URL:
+        return None
+    try:
+        prompt = """Analyze this nutrition label text and extract ALL nutrition values present in the label. Return the data in this JSON format:
+        {
+            "calories": number,
+            "protein": number,
+            "carbs": number,
+            "fat": number,
+            "fiber": number,
+            "sugar": number,
+            "sodium": number,
+            "serving_size": string,
+            "ingredients": string[],
+            "health_score": number (0-10),
+            "benefits": string[],
+            "warnings": string[],
+            "additional_nutrients": {
+                "nutrient_name": {
+                    "value": number,
+                    "unit": string,
+                    "daily_value": number (if available)
+                }
+            }
+        }
+        Rules:
+        1. Extract ALL nutrition values present in the label, not just the main ones
+        2. Include any vitamins, minerals, or other nutrients listed
+        3. For each nutrient, include its value, unit, and daily value percentage if available
+        4. Calculate health_score based on:
+           - High protein and fiber are good
+           - High sugar, sodium, and fat are bad
+           - Consider serving size in calculations
+        5. List benefits and warnings based on the nutritional values
+        Text to analyze: """
+        
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt + text}
+                    ]
+                }
+            ]
+        }
+        response = requests.post(GEMINI_API_URL, json=payload)
+        if response.status_code == 200:
+            try:
+                text = response.json()['candidates'][0]['content']['parts'][0]['text']
+                import re, json as pyjson
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                if match:
+                    return pyjson.loads(match.group(0))
+            except Exception as e:
+                print(f"Error parsing Gemini nutrition response: {e}")
+        else:
+            print(f"Gemini API error: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"Error calling Gemini API for nutrition: {e}")
+    return None
+
 @app.route('/extract_nutrition', methods=['POST'])
 def extract_nutrition_api():
     data = request.get_json()
     if not data or 'text' not in data:
         return jsonify({'status': 'error', 'message': 'No text provided'}), 400
+    
     text = data['text']
+    
+    # Try Gemini API first
+    gemini_result = analyze_nutrition_with_gemini(text)
+    if gemini_result:
+        return jsonify({
+            'status': 'success',
+            'nutrition': gemini_result,
+            'source': 'gemini'
+        })
+    
+    # Fallback to local extraction
     nutrition = extract_nutrition(text)
-    return jsonify({'status': 'success', 'nutrition': nutrition})
+    return jsonify({
+        'status': 'success',
+        'nutrition': nutrition,
+        'source': 'local'
+    })
+
+@app.route('/get_iot_data')
+def get_iot_data():
+    print("\n=== GET /get_iot_data ===")
+    try:
+        data = serial_reader.get_latest_data()
+        print(f"Raw data from serial reader: {data}")
+        
+        # Ensure all values are properly formatted
+        response_data = {
+            'temperature': float(data.get('temperature', 0)),
+            'humidity': float(data.get('humidity', 0)),
+            'lastUpdate': str(data.get('lastUpdate', 'Never')),
+            'connected': bool(data.get('connected', False))
+        }
+        
+        print(f"Formatted response data: {response_data}")
+        return jsonify(response_data)
+    except Exception as e:
+        print(f"Error in get_iot_data: {str(e)}")
+        return jsonify({
+            'temperature': 0.0,
+            'humidity': 0.0,
+            'lastUpdate': f'Error: {str(e)}',
+            'connected': False
+        })
+
+@app.route('/set_port', methods=['POST'])
+def set_port():
+    try:
+        data = request.get_json()
+        new_port = data.get('port')
+        if not new_port:
+            return jsonify({'error': 'No port specified'}), 400
+            
+        SerialReader.set_port(new_port)
+        return jsonify({
+            'message': 'Port updated successfully',
+            'current_config': ARDUINO_CONFIG
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/send_email', methods=['POST'])
+def send_email():
+    try:
+        data = request.get_json()
+        if not data or 'email' not in data or 'nutritionData' not in data:
+            return jsonify({'status': 'error', 'message': 'Missing required data'}), 400
+
+        recipient_email = data['email']
+        nutrition_data = data['nutritionData']
+
+        # Create email message
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = recipient_email
+        msg['Subject'] = 'Your Nutrition Analysis Results'
+
+        # Create HTML content
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <h2 style="color: #2e7d32;">Nutrition Analysis Results</h2>
+            
+            <div style="background-color: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <h3 style="color: #1b5e20;">Health Score: {nutrition_data.get('health_score', 'N/A')}/10</h3>
+                
+                <h4>Main Nutrients:</h4>
+                <ul>
+                    <li>Calories: {nutrition_data.get('calories', 'N/A')}</li>
+                    <li>Protein: {nutrition_data.get('protein', 'N/A')}g</li>
+                    <li>Carbohydrates: {nutrition_data.get('carbs', 'N/A')}g</li>
+                    <li>Fat: {nutrition_data.get('fat', 'N/A')}g</li>
+                    <li>Fiber: {nutrition_data.get('fiber', 'N/A')}g</li>
+                    <li>Sugar: {nutrition_data.get('sugar', 'N/A')}g</li>
+                    <li>Sodium: {nutrition_data.get('sodium', 'N/A')}mg</li>
+                </ul>
+
+                <h4>Serving Size:</h4>
+                <p>{nutrition_data.get('serving_size', 'N/A')}</p>
+
+                <h4>Health Benefits:</h4>
+                <ul>
+                    {''.join(f'<li>{benefit}</li>' for benefit in nutrition_data.get('benefits', []))}
+                </ul>
+
+                <h4>Warnings:</h4>
+                <ul>
+                    {''.join(f'<li>{warning}</li>' for warning in nutrition_data.get('warnings', []))}
+                </ul>
+            </div>
+
+            <p style="color: #666; font-size: 0.9em;">
+                This analysis was performed using Fresh Eye's advanced nutrition analysis system.
+            </p>
+        </body>
+        </html>
+        """
+
+        msg.attach(MIMEText(html_content, 'html'))
+
+        # Connect to SMTP server and send email
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        return jsonify({'status': 'success', 'message': 'Email sent successfully'})
+
+    except Exception as e:
+        print(f"Error sending email: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# Add cleanup on app shutdown
+@app.teardown_appcontext
+def cleanup(exception=None):
+    serial_reader.stop()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True) 

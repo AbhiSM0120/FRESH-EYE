@@ -17,6 +17,8 @@ import {
   TrendingUp,
   X,
   RotateCcw,
+  PieChart as PieChartIcon,
+  Loader2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -31,6 +33,7 @@ import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from 'recharts';
 
 interface NutritionData {
   calories: number;
@@ -40,11 +43,16 @@ interface NutritionData {
   fiber: number;
   sugar: number;
   sodium: number;
+  serving_size: string;
   ingredients: string[];
-  servingSize: string;
-  healthScore: number;
+  health_score: number;
   warnings: string[];
   benefits: string[];
+  additional_nutrients?: Record<string, {
+    value: number;
+    unit: string;
+    daily_value?: number;
+  }>;
 }
 
 const mockNutritionData: NutritionData = {
@@ -55,6 +63,7 @@ const mockNutritionData: NutritionData = {
   fiber: 8,
   sugar: 4,
   sodium: 480,
+  serving_size: "1 cup (240ml)",
   ingredients: [
     "Organic Spinach",
     "Water",
@@ -64,72 +73,37 @@ const mockNutritionData: NutritionData = {
     "Iron",
     "Calcium",
   ],
-  servingSize: "1 cup (240ml)",
-  healthScore: 8.7,
+  health_score: 8.7,
   warnings: ["High in sodium"],
   benefits: ["High in iron", "Good source of fiber", "Rich in vitamins"],
 };
 
+const NUTRITION_COLORS = {
+  protein: '#FF6B6B',
+  carbs: '#4ECDC4',
+  fat: '#FFD93D',
+  fiber: '#95E1D3',
+  sugar: '#FF8B94',
+  sodium: '#6C5CE7'
+};
+
 // Helper: Parse nutrition facts from OCR text
-function parseNutritionFromText(text: string): NutritionData {
-  // Simple regex-based extraction (can be improved)
-  const get = (label: string, def = 0) => {
-    const match = text.match(new RegExp(label + '\\s*:?\\s*(\\d+)', 'i'));
-    return match ? parseInt(match[1], 10) : def;
-  };
-  const getFloat = (label: string, def = 0) => {
-    const match = text.match(new RegExp(label + '\\s*:?\\s*(\\d+\\.?\\d*)', 'i'));
-    return match ? parseFloat(match[1]) : def;
-  };
-  const getList = (label: string) => {
-    const match = text.match(new RegExp(label + '\\s*:?\\s*([A-Za-z0-9,\-\s]+)', 'i'));
-    return match ? match[1].split(',').map(s => s.trim()) : [];
-  };
-  const calories = get('calories');
-  const protein = getFloat('protein');
-  const carbs = getFloat('carb');
-  const fat = getFloat('fat');
-  const fiber = getFloat('fiber');
-  const sugar = getFloat('sugar');
-  const sodium = getFloat('sodium');
-  const servingSize = (() => {
-    const match = text.match(/serving size:?\s*([\w\s\d\(\)\/\.]+)\n?/i);
-    return match ? match[1].trim() : '';
-  })();
-  const ingredients = (() => {
-    const match = text.match(/ingredients:?\s*([A-Za-z0-9,\-\s]+)/i);
-    return match ? match[1].split(',').map(s => s.trim()) : [];
-  })();
-  // Health score: simple formula
-  let healthScore = 10;
-  if (sugar > 10) healthScore -= 2;
-  if (sodium > 400) healthScore -= 2;
-  if (fiber > 5) healthScore += 1;
-  if (protein > 10) healthScore += 1;
-  if (fat > 10) healthScore -= 1;
-  if (calories > 250) healthScore -= 1;
-  healthScore = Math.max(0, Math.min(10, healthScore));
-  // Warnings/benefits
-  const warnings = [];
-  if (sodium > 400) warnings.push('High in sodium');
-  if (sugar > 10) warnings.push('High in sugar');
-  const benefits = [];
-  if (fiber > 5) benefits.push('High in fiber');
-  if (protein > 10) benefits.push('High in protein');
-  return {
-    calories,
-    protein,
-    carbs,
-    fat,
-    fiber,
-    sugar,
-    sodium,
-    ingredients,
-    servingSize,
-    healthScore,
-    warnings,
-    benefits,
-  };
+async function parseNutritionFromText(text: string): Promise<NutritionData> {
+  // Send to backend for processing
+  return fetch('http://localhost:5000/extract_nutrition', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text }),
+  })
+    .then(response => response.json())
+    .then(data => {
+      if (data.status === 'success') {
+        return data.nutrition;
+      }
+      throw new Error(data.message || 'Failed to parse nutrition data');
+    });
 }
 
 export default function ScanLabel() {
@@ -143,6 +117,8 @@ export default function ScanLabel() {
   const [model, setModel] = useState<mobilenet.MobileNet | null>(null);
   const [isModelLoading, setIsModelLoading] = useState(true);
   const [videoConstraints, setVideoConstraints] = useState<any>({ facingMode: "environment" });
+  const [processingStatus, setProcessingStatus] = useState<string | null>(null);
+  const [emailStatus, setEmailStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
 
   useEffect(() => {
     const checkCameraPermission = async () => {
@@ -190,18 +166,80 @@ export default function ScanLabel() {
     });
   }, []);
 
-  const runOcrAndParse = async (imageSrc: string) => {
-    setIsScanning(true);
+  const handleCapture = async () => {
+    if (!webcamRef.current) return;
+    
     try {
-      const result = await Tesseract.recognize(imageSrc, 'eng', { logger: m => console.log(m) });
-      const text = result.data.text;
-      console.log('OCR Text:', text);
-      const nutrition = parseNutritionFromText(text);
+      setIsScanning(true);
+      setCameraError(null);
+      setProcessingStatus('Capturing image...');
+      
+      // Get the current frame from the webcam
+      const imageSrc = webcamRef.current.getScreenshot();
+      if (!imageSrc) {
+        throw new Error('Failed to capture image');
+      }
+
+      // Convert base64 to blob for better quality
+      const response = await fetch(imageSrc);
+      const blob = await response.blob();
+      
+      // Create a new image to get dimensions
+      const img = new Image();
+      img.src = imageSrc;
+      await new Promise((resolve) => {
+        img.onload = resolve;
+      });
+
+      // Create a canvas to process the image
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Failed to get canvas context');
+
+      // Set canvas size to match image
+      canvas.width = img.width;
+      canvas.height = img.height;
+
+      // Draw image with white background
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+
+      // Convert to blob with better quality
+      const processedBlob = await new Promise<Blob>((resolve) => {
+        canvas.toBlob((blob) => {
+          if (blob) resolve(blob);
+        }, 'image/jpeg', 0.95);
+      });
+
+      // Convert blob to base64
+      const reader = new FileReader();
+      const base64Image = await new Promise<string>((resolve) => {
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.readAsDataURL(processedBlob);
+      });
+
+      setProcessingStatus('Processing image...');
+      
+      // Process the image
+      const result = await Tesseract.recognize(base64Image, 'eng', { 
+        logger: m => console.log(m),
+        // @ts-ignore - Tesseract types are incomplete
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,:;()[]{}%/-+ ',
+        tessedit_pageseg_mode: '6'
+      });
+      
+      setProcessingStatus('Analyzing nutrition information...');
+      
+      const nutrition = await parseNutritionFromText(result.data.text);
       setScanResult(nutrition);
+      
     } catch (err) {
-      setCameraError('OCR failed. Please try again.');
+      console.error('Camera capture error:', err);
+      setCameraError('Failed to capture image. Please try again with better lighting and focus.');
     } finally {
       setIsScanning(false);
+      setProcessingStatus(null);
     }
   };
 
@@ -217,10 +255,30 @@ export default function ScanLabel() {
     }
   };
 
-  const handleCameraCapture = async () => {
-    const imageSrc = webcamRef.current?.getScreenshot();
-    if (imageSrc) {
-      runOcrAndParse(imageSrc);
+  const runOcrAndParse = async (imageSrc: string) => {
+    setIsScanning(true);
+    setCameraError(null);
+    try {
+      setScanResult(null);
+      
+      const result = await Tesseract.recognize(imageSrc, 'eng', { 
+        logger: m => console.log(m),
+        // @ts-ignore - Tesseract types are incomplete
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,:;()[]{}%/-+ ',
+        tessedit_pageseg_mode: '6'
+      });
+      const text = result.data.text;
+      
+      setProcessingStatus('Analyzing nutrition information...');
+      
+      const nutrition = await parseNutritionFromText(text);
+      setScanResult(nutrition);
+    } catch (err) {
+      console.error('OCR Error:', err);
+      setCameraError('Failed to analyze nutrition label. Please try again with better lighting and focus.');
+    } finally {
+      setIsScanning(false);
+      setProcessingStatus(null);
     }
   };
 
@@ -241,6 +299,33 @@ export default function ScanLabel() {
     if (score >= 8) return "Excellent";
     if (score >= 6) return "Good";
     return "Poor";
+  };
+
+  const handleEmailShare = async () => {
+    try {
+      setEmailStatus('sending');
+      const response = await fetch('http://localhost:5000/send_email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          email: 'example@gmail.com',
+          nutritionData: scanResult
+        }),
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to send email');
+      }
+      
+      setEmailStatus('sent');
+      setTimeout(() => setEmailStatus('idle'), 3000);
+    } catch (error) {
+      console.error('Email error:', error);
+      setEmailStatus('error');
+      setTimeout(() => setEmailStatus('idle'), 3000);
+    }
   };
 
   return (
@@ -337,46 +422,64 @@ export default function ScanLabel() {
                         <AlertDescription>Waiting for camera permission...</AlertDescription>
                       </Alert>
                     ) : (
-                      <div className="relative rounded-lg overflow-hidden bg-black">
+                      <div className="relative aspect-video w-full max-w-2xl mx-auto rounded-lg overflow-hidden bg-gray-100">
                         <Webcam
                           ref={webcamRef}
                           audio={false}
                           screenshotFormat="image/jpeg"
-                          className="w-full"
                           videoConstraints={videoConstraints}
-                          onUserMediaError={(error) => {
-                            setCameraError("Unable to access camera. Please check permissions.");
+                          className="w-full h-full object-cover"
+                          onUserMedia={() => setIsModelLoading(false)}
+                          onUserMediaError={(err) => {
+                            console.error('Camera error:', err);
+                            setCameraError('Failed to access camera. Please check permissions and try again.');
                           }}
                         />
-                        <div className="absolute inset-0 border-2 border-emerald-400 rounded-lg pointer-events-none">
-                          <div className="absolute top-4 left-4 w-8 h-8 border-l-2 border-t-2 border-emerald-400"></div>
-                          <div className="absolute top-4 right-4 w-8 h-8 border-r-2 border-t-2 border-emerald-400"></div>
-                          <div className="absolute bottom-4 left-4 w-8 h-8 border-l-2 border-b-2 border-emerald-400"></div>
-                          <div className="absolute bottom-4 right-4 w-8 h-8 border-r-2 border-b-2 border-emerald-400"></div>
-                        </div>
+                        {isModelLoading && (
+                          <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50">
+                            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
+                          </div>
+                        )}
+                        {cameraError && (
+                          <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50">
+                            <div className="bg-white p-4 rounded-lg shadow-lg max-w-sm mx-4">
+                              <p className="text-red-600 mb-2">{cameraError}</p>
+                              <Button
+                                variant="outline"
+                                onClick={() => setCameraError(null)}
+                                className="w-full"
+                              >
+                                Try Again
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                        {!isModelLoading && !cameraError && (
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <div className="border-2 border-white/50 rounded-lg p-4">
+                              <p className="text-white text-center mb-2">Position the label within the frame</p>
+                              <Button
+                                onClick={handleCapture}
+                                disabled={isScanning}
+                                className="bg-emerald-600 hover:bg-emerald-700 text-white"
+                              >
+                                {isScanning ? (
+                                  <>
+                                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                                    {processingStatus || 'Processing...'}
+                                  </>
+                                ) : (
+                                  <>
+                                    <Camera className="h-4 w-4 mr-2" />
+                                    Capture
+                                  </>
+                                )}
+                              </Button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
-
-                    <div className="text-center">
-                      <Button
-                        onClick={handleCameraCapture}
-                        size="lg"
-                        className="bg-health-gradient"
-                        disabled={!!cameraError || isScanning || isModelLoading}
-                      >
-                        {isScanning ? (
-                          <>
-                            <Scan className="h-5 w-5 mr-2 animate-spin" />
-                            Analyzing...
-                          </>
-                        ) : (
-                          <>
-                            <Camera className="h-5 w-5 mr-2" />
-                            Capture & Scan
-                          </>
-                        )}
-                      </Button>
-                    </div>
                   </div>
                 </TabsContent>
               </Tabs>
@@ -405,24 +508,19 @@ export default function ScanLabel() {
         </div>
       ) : null}
 
-      {/* Scanning Animation */}
+      {/* Loading Overlay */}
       {isScanning && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <Card className="w-96 bg-white">
-            <CardContent className="p-8 text-center">
-              <div className="h-16 w-16 mx-auto mb-4 animate-spin">
-                <Scan className="h-16 w-16 text-emerald-600" />
-              </div>
-              <h3 className="text-lg font-medium text-gray-900 mb-2">
-                Analyzing Nutrition Label
-              </h3>
-              <p className="text-gray-600 mb-4">
-                Our AI is reading the label and calculating health metrics...
-              </p>
-              <Progress value={33} className="mb-2" />
-              <p className="text-sm text-gray-500">Processing OCR data...</p>
-            </CardContent>
-          </Card>
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-8 max-w-md w-full mx-4 text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-emerald-600 mx-auto mb-4"></div>
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">
+              {processingStatus || 'Scanning Nutrition Label...'}
+            </h3>
+            <p className="text-gray-600">
+              Please hold the camera steady and ensure good lighting
+            </p><br />
+            <p className="text-gray-600">Extracting nutrition information...</p>
+          </div>
         </div>
       )}
 
@@ -451,42 +549,60 @@ export default function ScanLabel() {
                 </Button>
               </div>
 
-              <div className="grid md:grid-cols-3 gap-6">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div className="text-center">
                   <div
-                    className={`inline-flex items-center justify-center w-20 h-20 rounded-full bg-${getHealthScoreColor(scanResult.healthScore)}-100 mb-4`}
+                    className={`inline-flex items-center justify-center w-20 h-20 rounded-full bg-${getHealthScoreColor(scanResult.health_score)}-100 mb-4`}
                   >
-                    <span
-                      className={`text-2xl font-bold text-${getHealthScoreColor(scanResult.healthScore)}-600`}
-                    >
-                      {scanResult.healthScore}
-                    </span>
+                    <div className="text-center">
+                      <span
+                        className={`text-2xl font-bold text-${getHealthScoreColor(scanResult.health_score)}-600 block`}
+                      >
+                        {scanResult.health_score?.toFixed(1) || '0.0'}
+                      </span>
+                      <span className={`text-xs text-${getHealthScoreColor(scanResult.health_score)}-600 block`}>
+                        out of 10
+                      </span>
+                    </div>
                   </div>
                   <h3 className="font-medium text-gray-900">Health Score</h3>
                   <p
-                    className={`text-sm text-${getHealthScoreColor(scanResult.healthScore)}-600`}
+                    className={`text-sm text-${getHealthScoreColor(scanResult.health_score)}-600`}
                   >
-                    {getHealthScoreLabel(scanResult.healthScore)}
+                    {getHealthScoreLabel(scanResult.health_score)}
                   </p>
                 </div>
 
                 <div className="text-center">
                   <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-blue-100 mb-4">
-                    <Zap className="h-8 w-8 text-blue-600" />
+                    <div className="text-center">
+                      <Zap className="h-8 w-8 text-blue-600 mx-auto mb-1" />
+                      <span className="text-2xl font-bold text-blue-600 block">
+                        {scanResult.calories || 0}
+                      </span>
+                      <span className="text-xs text-blue-600 block">
+                        calories
+                      </span>
+                    </div>
                   </div>
                   <h3 className="font-medium text-gray-900">Calories</h3>
                   <p className="text-sm text-gray-600">
-                    {scanResult.calories} per serving
+                    per serving
                   </p>
                 </div>
 
                 <div className="text-center">
-                  <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-purple-100 mb-4">
-                    <Heart className="h-8 w-8 text-purple-600" />
+                  <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-purple-100 mb-4 p-2">
+                    <div className="text-center">
+                      <Heart className="h-8 w-8 text-purple-600 mx-auto mb-1" />
+                      <span className="text-sm text-purple-600 block">
+                        Serving Size
+                      </span>
+                    </div>
                   </div>
                   <h3 className="font-medium text-gray-900">Serving Size</h3>
                   <p className="text-sm text-gray-600">
-                    {scanResult.servingSize}
+                    {scanResult.serving_size || 'Not specified'}
                   </p>
                 </div>
               </div>
@@ -494,24 +610,69 @@ export default function ScanLabel() {
           </Card>
 
           {/* Nutrition Breakdown */}
-          <div className="grid lg:grid-cols-2 gap-8">
+          <div className="space-y-6">
+            {/* Nutrition Distribution Chart */}
+            <Card className="bg-white/80 backdrop-blur-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center">
+                  <PieChartIcon className="h-5 w-5 mr-2 text-emerald-600" />
+                  NUTRITION DISTRIBUTION
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="h-[400px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={[
+                          { name: 'Protein', value: scanResult.protein || 0 },
+                          { name: 'Carbs', value: scanResult.carbs || 0 },
+                          { name: 'Fat', value: scanResult.fat || 0 },
+                          { name: 'Fiber', value: scanResult.fiber || 0 },
+                          { name: 'Sugar', value: scanResult.sugar || 0 },
+                          { name: 'Sodium', value: (scanResult.sodium || 0) / 1000 }
+                        ]}
+                        cx="50%"
+                        cy="50%"
+                        labelLine={false}
+                        outerRadius={120}
+                        fill="#8884d8"
+                        dataKey="value"
+                        label={({ name, percent }) => `${name}: ${(percent * 100).toFixed(0)}%`}
+                      >
+                        {Object.entries(NUTRITION_COLORS).map(([key, color]) => (
+                          <Cell key={key} fill={color} />
+                        ))}
+                      </Pie>
+                      <Tooltip 
+                        formatter={(value: number) => [`${value.toFixed(1)}g`, 'Amount']}
+                      />
+                      <Legend />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Detailed Nutrition Values */}
             <Card className="bg-white/80 backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="flex items-center">
                   <Target className="h-5 w-5 mr-2 text-emerald-600" />
-                  Macronutrients
+                  NUTRITION VALUES
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
+                {/* Main Nutrients */}
                 <div className="space-y-3">
                   <div className="flex justify-between items-center">
                     <span className="text-sm font-medium">Protein</span>
                     <span className="text-sm text-gray-600">
-                      {scanResult.protein}g
+                      {scanResult.protein || 0}g
                     </span>
                   </div>
                   <Progress
-                    value={(scanResult.protein / 50) * 100}
+                    value={((scanResult.protein || 0) / 50) * 100}
                     className="h-2"
                   />
                 </div>
@@ -520,11 +681,11 @@ export default function ScanLabel() {
                   <div className="flex justify-between items-center">
                     <span className="text-sm font-medium">Carbohydrates</span>
                     <span className="text-sm text-gray-600">
-                      {scanResult.carbs}g
+                      {scanResult.carbs || 0}g
                     </span>
                   </div>
                   <Progress
-                    value={(scanResult.carbs / 300) * 100}
+                    value={((scanResult.carbs || 0) / 300) * 100}
                     className="h-2"
                   />
                 </div>
@@ -533,11 +694,11 @@ export default function ScanLabel() {
                   <div className="flex justify-between items-center">
                     <span className="text-sm font-medium">Fat</span>
                     <span className="text-sm text-gray-600">
-                      {scanResult.fat}g
+                      {scanResult.fat || 0}g
                     </span>
                   </div>
                   <Progress
-                    value={(scanResult.fat / 70) * 100}
+                    value={((scanResult.fat || 0) / 70) * 100}
                     className="h-2"
                   />
                 </div>
@@ -546,11 +707,11 @@ export default function ScanLabel() {
                   <div className="flex justify-between items-center">
                     <span className="text-sm font-medium">Fiber</span>
                     <span className="text-sm text-gray-600">
-                      {scanResult.fiber}g
+                      {scanResult.fiber || 0}g
                     </span>
                   </div>
                   <Progress
-                    value={(scanResult.fiber / 25) * 100}
+                    value={((scanResult.fiber || 0) / 25) * 100}
                     className="h-2"
                   />
                 </div>
@@ -559,11 +720,11 @@ export default function ScanLabel() {
                   <div className="flex justify-between items-center">
                     <span className="text-sm font-medium">Sugar</span>
                     <span className="text-sm text-gray-600">
-                      {scanResult.sugar}g
+                      {scanResult.sugar || 0}g
                     </span>
                   </div>
                   <Progress
-                    value={(scanResult.sugar / 50) * 100}
+                    value={((scanResult.sugar || 0) / 50) * 100}
                     className="h-2"
                   />
                 </div>
@@ -572,33 +733,55 @@ export default function ScanLabel() {
                   <div className="flex justify-between items-center">
                     <span className="text-sm font-medium">Sodium</span>
                     <span className="text-sm text-gray-600">
-                      {scanResult.sodium}mg
+                      {scanResult.sodium || 0}mg
                     </span>
                   </div>
                   <Progress
-                    value={(scanResult.sodium / 2300) * 100}
+                    value={((scanResult.sodium || 0) / 2300) * 100}
                     className="h-2"
                   />
                 </div>
+
+                {/* Additional Nutrients */}
+                {scanResult.additional_nutrients && Object.entries(scanResult.additional_nutrients).map(([name, data]: [string, any]) => (
+                  <div key={name} className="space-y-3">
+                    <div className="flex justify-between items-center">
+                      <span className="text-sm font-medium capitalize">{name.replace(/_/g, ' ')}</span>
+                      <span className="text-sm text-gray-600">
+                        {data.value || 0}{data.unit}
+                        {data.daily_value && ` (${data.daily_value}% DV)`}
+                      </span>
+                    </div>
+                    {data.daily_value && (
+                      <Progress
+                        value={data.daily_value}
+                        className="h-2"
+                      />
+                    )}
+                  </div>
+                ))}
               </CardContent>
             </Card>
+          </div>
 
-            <Card className="bg-white/80 backdrop-blur-sm">
-              <CardHeader>
-                <CardTitle className="flex items-center">
-                  <TrendingUp className="h-5 w-5 mr-2 text-emerald-600" />
-                  Health Insights
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-6">
-                {/* Benefits */}
-                <div>
-                  <h4 className="font-medium text-gray-900 mb-3 flex items-center">
-                    <CheckCircle className="h-4 w-4 mr-2 text-emerald-600" />
-                    Health Benefits
-                  </h4>
-                  <div className="space-y-2">
-                    {scanResult.benefits.map((benefit, index) => (
+          {/* Health Insights */}
+          <Card className="bg-white/80 backdrop-blur-sm">
+            <CardHeader>
+              <CardTitle className="flex items-center">
+                <TrendingUp className="h-5 w-5 mr-2 text-emerald-600" />
+                Health Insights
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Benefits */}
+              <div>
+                <h4 className="font-medium text-gray-900 mb-3 flex items-center">
+                  <CheckCircle className="h-4 w-4 mr-2 text-emerald-600" />
+                  Health Benefits
+                </h4>
+                <div className="space-y-2">
+                  {scanResult.benefits && scanResult.benefits.length > 0 ? (
+                    scanResult.benefits.map((benefit, index) => (
                       <Badge
                         key={index}
                         variant="outline"
@@ -606,20 +789,24 @@ export default function ScanLabel() {
                       >
                         {benefit}
                       </Badge>
-                    ))}
-                  </div>
+                    ))
+                  ) : (
+                    <p className="text-sm text-gray-500">No significant health benefits detected</p>
+                  )}
                 </div>
+              </div>
 
-                <Separator />
+              <Separator />
 
-                {/* Warnings */}
-                <div>
-                  <h4 className="font-medium text-gray-900 mb-3 flex items-center">
-                    <AlertTriangle className="h-4 w-4 mr-2 text-amber-600" />
-                    Considerations
-                  </h4>
-                  <div className="space-y-2">
-                    {scanResult.warnings.map((warning, index) => (
+              {/* Warnings */}
+              <div>
+                <h4 className="font-medium text-gray-900 mb-3 flex items-center">
+                  <AlertTriangle className="h-4 w-4 mr-2 text-amber-600" />
+                  Considerations
+                </h4>
+                <div className="space-y-2">
+                  {scanResult.warnings && scanResult.warnings.length > 0 ? (
+                    scanResult.warnings.map((warning, index) => (
                       <Badge
                         key={index}
                         variant="outline"
@@ -627,25 +814,33 @@ export default function ScanLabel() {
                       >
                         {warning}
                       </Badge>
-                    ))}
-                  </div>
+                    ))
+                  ) : (
+                    <p className="text-sm text-gray-500">No significant health concerns detected</p>
+                  )}
                 </div>
+              </div>
 
-                <Separator />
+              <Separator />
 
-                {/* Ingredients Preview */}
-                <div>
-                  <h4 className="font-medium text-gray-900 mb-3">
-                    Key Ingredients
-                  </h4>
-                  <p className="text-sm text-gray-600 leading-relaxed">
-                    {scanResult.ingredients.slice(0, 4).join(", ")}
-                    {scanResult.ingredients.length > 4 && "..."}
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
+              {/* Ingredients Preview */}
+              <div>
+                <h4 className="font-medium text-gray-900 mb-3">
+                  Key Ingredients
+                </h4>
+                <p className="text-sm text-gray-600 leading-relaxed">
+                  {scanResult.ingredients && scanResult.ingredients.length > 0 ? (
+                    <>
+                      {scanResult.ingredients.slice(0, 4).join(", ")}
+                      {scanResult.ingredients.length > 4 && "..."}
+                    </>
+                  ) : (
+                    "No ingredients detected"
+                  )}
+                </p>
+              </div>
+            </CardContent>
+          </Card>
 
           {/* Actions */}
           <div className="flex flex-col sm:flex-row gap-4 justify-center">
