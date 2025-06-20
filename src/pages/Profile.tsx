@@ -65,7 +65,7 @@ interface UserProfile {
 
 const initialProfile: UserProfile = {
   name: "Sarah Johnson",
-  email: "sarah.johnson@email.com",
+  email: "akash@gmail.com",
   age: 32,
   weight: 65,
   height: 168,

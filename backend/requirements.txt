@@ -3,4 +3,6 @@ numpy
 tensorflow
 pillow
 transformers
-torch 
+torch
+pyserial
+flask-cors 
